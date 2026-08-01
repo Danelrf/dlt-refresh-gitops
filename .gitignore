@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# uv / virtualenv
+.venv/
+
+# Databricks Asset Bundle build output
+.databricks/
+
+# Claude Code local, per-machine settings (settings.json is shared, .local is not)
+.claude/settings.local.json
