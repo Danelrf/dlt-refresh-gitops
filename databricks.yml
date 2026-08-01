@@ -1,0 +1,67 @@
+# Databricks Asset Bundle: deploys the SDP pipeline alongside the governance flow.
+# Docs: https://docs.databricks.com/dev-tools/bundles
+
+bundle:
+  name: dlt-refresh-gitops
+
+resources:
+  pipelines:
+    orders_pipeline:
+      name: "orders-pipeline-${bundle.target}"
+      catalog: main
+      target: "orders_${bundle.target}"
+      serverless: true
+      libraries:
+        - file:
+            path: ./src/pipeline.py
+      # Continuous=false: triggered updates only, so refreshes happen exactly
+      # when the release workflow (or schedule) says so.
+      continuous: false
+
+targets:
+  # Local iteration only — never deployed by CI. `mode: development` prefixes
+  # every resource with the deploying user, so engineers don't collide.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: ${var.databricks_host}
+
+  # Shared integration environment, deployed on every merge to main.
+  # `mode: production` despite the name — it's what gives stable, unprefixed
+  # resource names, which a shared environment needs.
+  tst:
+    mode: production
+    workspace:
+      host: ${var.databricks_host}
+    run_as:
+      service_principal_name: ${var.service_principal_id}
+    permissions:
+      - level: CAN_MANAGE
+        service_principal_name: ${var.service_principal_id}
+      # Engineers can trigger updates and refreshes freely here — that's the
+      # point of tst. The governance gate applies to prd only.
+      - level: CAN_RUN
+        group_name: engineers
+
+  # Production. Deployed only from a v* tag; a full refresh additionally
+  # requires an approved entry in pipelines/refresh-requests.yaml.
+  prd:
+    mode: production
+    workspace:
+      host: ${var.databricks_host}
+    # In prd the pipeline runs as the service principal, not a human —
+    # engineers hold no run/manage permission on the deployed pipeline.
+    run_as:
+      service_principal_name: ${var.service_principal_id}
+    permissions:
+      - level: CAN_MANAGE
+        service_principal_name: ${var.service_principal_id}
+      - level: CAN_VIEW
+        group_name: engineers
+
+variables:
+  databricks_host:
+    description: Workspace URL for this environment, e.g. https://adb-xxxx.azuredatabricks.net
+  service_principal_id:
+    description: Application ID of the execution service principal

@@ -1,0 +1,226 @@
+name: Release (prd)
+
+on:
+  push:
+    tags: ['v*']
+
+# Never let two releases refresh the same pipeline concurrently.
+concurrency:
+  group: release-prd
+  cancel-in-progress: false
+
+jobs:
+  # 1) Always deploy the pipeline code for this release.
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prd
+    permissions:
+      contents: read
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.SP_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
+      BUNDLE_VAR_databricks_host: ${{ vars.DATABRICKS_HOST }}
+      BUNDLE_VAR_service_principal_id: ${{ vars.SP_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        run: databricks bundle validate --target prd
+
+      - name: Deploy bundle (prd)
+        run: databricks bundle deploy --target prd
+
+  # 2) Does this release request a refresh? Its own job so that "no request"
+  #    renders as a cleanly skipped refresh job rather than a silent no-op.
+  check-refresh:
+    needs: deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      match: ${{ steps.check.outputs.match }}
+      pipeline_key: ${{ steps.check.outputs.pipeline_key }}
+      reason: ${{ steps.check.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Match refresh request for this version
+        id: check
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          REQUESTS=pipelines/refresh-requests.yaml
+
+          COUNT=$(yq '[.[] | select(.release_version == env(VERSION))] | length' "$REQUESTS")
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No refresh requested for $VERSION — deploy only."
+            echo "match=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Two entries for one tag is a review mistake, not something to guess
+          # at. Refusing beats refreshing the wrong pipeline.
+          if [ "$COUNT" -gt 1 ]; then
+            echo "::error::$COUNT refresh requests found for $VERSION; expected exactly 1"
+            exit 1
+          fi
+
+          ENTRY=$(yq -o=json '.[] | select(.release_version == env(VERSION))' "$REQUESTS")
+          PIPELINE_KEY=$(echo "$ENTRY" | yq -r '.pipeline_key')
+          REASON=$(echo "$ENTRY" | yq -r '.reason')
+
+          for field in PIPELINE_KEY REASON; do
+            if [ -z "${!field}" ] || [ "${!field}" = "null" ]; then
+              echo "::error::refresh request for $VERSION is missing $field"
+              exit 1
+            fi
+          done
+
+          echo "match=true" >> "$GITHUB_OUTPUT"
+          echo "pipeline_key=$PIPELINE_KEY" >> "$GITHUB_OUTPUT"
+          # Delimiter form: a multi-line reason would otherwise corrupt the file.
+          {
+            echo "reason<<__REASON_EOF__"
+            echo "$REASON"
+            echo "__REASON_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+  # 3) Refresh. Skipped entirely unless a request was found.
+  refresh:
+    needs: [deploy, check-refresh]
+    if: needs.check-refresh.outputs.match == 'true'
+    runs-on: ubuntu-latest
+    environment: prd
+    permissions:
+      contents: read
+      issues: write
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.SP_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
+      BUNDLE_VAR_databricks_host: ${{ vars.DATABRICKS_HOST }}
+      BUNDLE_VAR_service_principal_id: ${{ vars.SP_CLIENT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      # Passed as env, never interpolated into a shell string: `reason` is
+      # PR-authored text and would otherwise be a command-injection vector
+      # on a runner holding the prd service principal secret.
+      VERSION: ${{ github.ref_name }}
+      PIPELINE_KEY: ${{ needs.check-refresh.outputs.pipeline_key }}
+      REASON: ${{ needs.check-refresh.outputs.reason }}
+      ACTOR: ${{ github.actor }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      # Idempotency: the audit issue doubles as the "already executed" record.
+      # Any failure to determine this must block, never wave the refresh through.
+      - name: Idempotency check
+        id: dedupe
+        run: |
+          if ! EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+              --label "refresh-audit" --state all \
+              --search "\"$VERSION $PIPELINE_KEY\" in:title" \
+              --json number --jq 'length'); then
+            echo "::error::could not query existing audit issues — refusing to refresh"
+            exit 1
+          fi
+          case "$EXISTING" in
+            ''|*[!0-9]*)
+              echo "::error::unexpected issue count '$EXISTING' — refusing to refresh"
+              exit 1
+              ;;
+          esac
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "Audit issue already exists for $VERSION $PIPELINE_KEY — nothing to do."
+            echo "already_run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Claim before acting: if the issue can't be created we must not refresh.
+      # A crash between refreshing and recording would otherwise leave prod
+      # refreshed with no audit record — and because dedupe keys off that
+      # record, a re-run would refresh a second time.
+      - name: Open audit issue (claim)
+        id: claim
+        if: steps.dedupe.outputs.already_run == 'false'
+        run: |
+          printf '%s\n' \
+            "**Reason:** $REASON" \
+            "**Tagged by:** @$ACTOR" \
+            "**Workflow run:** $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "" \
+            "Status: **triggering** — updated with the outcome when this run finishes." \
+            > body.md
+          URL=$(gh issue create --repo "$GITHUB_REPOSITORY" \
+            --label "refresh-audit" \
+            --title "Full refresh: $VERSION $PIPELINE_KEY" \
+            --body-file body.md)
+          echo "number=${URL##*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger full refresh
+        id: trigger
+        if: steps.dedupe.outputs.already_run == 'false'
+        run: |
+          PIPELINE_ID=$(databricks bundle summary --target prd -o json \
+            | jq -r --arg k "$PIPELINE_KEY" '.resources.pipelines[$k].id')
+          if [ -z "$PIPELINE_ID" ] || [ "$PIPELINE_ID" = "null" ]; then
+            echo "::error::pipeline_key '$PIPELINE_KEY' not found in the prd bundle"
+            exit 1
+          fi
+
+          # Record the newest update before triggering, so the new update can be
+          # told apart from whatever was already at the head of the list.
+          BEFORE=$(databricks pipelines list-updates "$PIPELINE_ID" -o json \
+            | jq -r '.updates[0].update_id // "none"')
+
+          databricks bundle run "$PIPELINE_KEY" \
+            --target prd --full-refresh-all --no-wait
+
+          UPDATE_ID="$BEFORE"
+          for _ in $(seq 1 30); do
+            UPDATE_ID=$(databricks pipelines list-updates "$PIPELINE_ID" -o json \
+              | jq -r '.updates[0].update_id // "none"')
+            [ "$UPDATE_ID" != "$BEFORE" ] && break
+            sleep 2
+          done
+          if [ "$UPDATE_ID" = "$BEFORE" ]; then
+            echo "::error::refresh triggered but no new update appeared within 60s"
+            exit 1
+          fi
+          echo "update_id=$UPDATE_ID" >> "$GITHUB_OUTPUT"
+
+      # Runs even if the trigger failed, so the claimed issue always ends up
+      # stating what actually happened, then gets locked.
+      - name: Finalise and lock audit issue
+        if: always() && steps.claim.outcome == 'success'
+        env:
+          NUMBER: ${{ steps.claim.outputs.number }}
+          UPDATE_ID: ${{ steps.trigger.outputs.update_id }}
+          TRIGGER_OUTCOME: ${{ steps.trigger.outcome }}
+        run: |
+          if [ "$TRIGGER_OUTCOME" = "success" ]; then
+            STATUS="**triggered** (\`--no-wait\`: confirm completion on the Databricks update)"
+          else
+            STATUS="**FAILED to trigger** — no refresh ran. Investigate before re-tagging."
+          fi
+          HASH=$(printf '%s|%s|%s|%s|%s' \
+            "$VERSION" "$PIPELINE_KEY" "$REASON" "$ACTOR" "$UPDATE_ID" \
+            | sha256sum | cut -d' ' -f1)
+          printf '%s\n' \
+            "**Reason:** $REASON" \
+            "**Tagged by:** @$ACTOR" \
+            "**Databricks update_id:** $UPDATE_ID" \
+            "**Workflow run:** $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "" \
+            "Status: $STATUS" \
+            "" \
+            "**Integrity hash:** \`$HASH\`" \
+            > body.md
+          gh issue edit "$NUMBER" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          gh issue lock "$NUMBER" --repo "$GITHUB_REPOSITORY"

@@ -1,0 +1,56 @@
+name: Deploy (tst)
+
+on:
+  push:
+    branches: [main]
+
+# Serialise deploys so two merges in quick succession can't race.
+concurrency:
+  group: deploy-tst
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # PySpark 4 requires a JDK 17+.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Unit tests
+        run: uv run pytest -q
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    # Supplies DATABRICKS_HOST / SP_CLIENT_ID / SP_CLIENT_SECRET for tst.
+    environment: tst
+    permissions:
+      contents: read
+    env:
+      DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ vars.SP_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.SP_CLIENT_SECRET }}
+      BUNDLE_VAR_databricks_host: ${{ vars.DATABRICKS_HOST }}
+      BUNDLE_VAR_service_principal_id: ${{ vars.SP_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+
+      - name: Validate bundle
+        run: databricks bundle validate --target tst
+
+      - name: Deploy bundle (tst)
+        run: databricks bundle deploy --target tst
