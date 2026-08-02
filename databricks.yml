@@ -1,0 +1,111 @@
+# Databricks Asset Bundle: deploys the SDP pipeline alongside the governance flow.
+# Docs: https://docs.databricks.com/dev-tools/bundles
+#
+# Division of labour with infra/:
+#   Terraform owns the durable, security-relevant substrate — workspace,
+#   storage, service principals, catalogs and catalog grants.
+#   This bundle owns the application artifacts — schemas, the landing volume and
+#   the pipeline. That split is what lets an engineer run
+#   `databricks bundle deploy --target dev` and get their own personally-
+#   prefixed schemas without a Terraform change.
+
+bundle:
+  name: dlt-refresh-gitops
+
+resources:
+  schemas:
+    bronze:
+      catalog_name: ${var.catalog}
+      name: bronze
+      comment: "Raw ingest and cleaned tables produced by the orders pipeline."
+    silver:
+      catalog_name: ${var.catalog}
+      name: silver
+      comment: "Modelled tables built on top of bronze."
+
+  volumes:
+    # Auto Loader source. Lives in bronze rather than a schema of its own —
+    # unstructured arrivals belong to the raw layer, not beside it.
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.bronze.name}
+      name: landing
+      volume_type: MANAGED
+      comment: "Auto Loader source files, one subdirectory per source."
+
+  pipelines:
+    orders_pipeline:
+      name: "orders-pipeline-${bundle.target}"
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.bronze.name}
+      serverless: true
+      libraries:
+        - file:
+            path: ./src/pipeline.py
+      # Continuous=false: triggered updates only, so refreshes happen exactly
+      # when the release workflow (or schedule) says so.
+      continuous: false
+      configuration:
+        # Passed rather than hardcoded: in dev this resolves to the engineer's
+        # own prefixed volume, so nobody ingests from a shared path by accident.
+        source_path: "/Volumes/${var.catalog}/${resources.schemas.bronze.name}/${resources.volumes.landing.name}/orders"
+
+targets:
+  # Local iteration only — never deployed by CI. `mode: development` prefixes
+  # every resource with the deploying user, so engineers don't collide: each
+  # gets their own schemas, volume and pipeline inside the shared dev catalog.
+  # Deployed as the engineer, not a service principal.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: ${var.databricks_host}
+    variables:
+      catalog: orders_dev
+
+  # Shared integration environment, deployed on every merge to main.
+  # `mode: production` despite the name — it's what gives stable, unprefixed
+  # resource names, which a shared environment needs.
+  tst:
+    mode: production
+    workspace:
+      host: ${var.databricks_host}
+    variables:
+      catalog: orders_tst
+    run_as:
+      service_principal_name: ${var.service_principal_id}
+    permissions:
+      - level: CAN_MANAGE
+        service_principal_name: ${var.service_principal_id}
+      # Engineers can trigger updates and refreshes freely here — that's the
+      # point of tst. The governance gate applies to prd only.
+      - level: CAN_RUN
+        group_name: engineers
+
+  # Production. Deployed only from a v* tag; a full refresh additionally
+  # requires an approved entry in governance/refresh-requests.yaml.
+  prd:
+    mode: production
+    workspace:
+      host: ${var.databricks_host}
+    variables:
+      catalog: orders_prd
+    # In prd the pipeline runs as the service principal, not a human —
+    # engineers hold no run/manage permission on the deployed pipeline, and no
+    # SELECT on the catalog either (see infra/variables.tf).
+    run_as:
+      service_principal_name: ${var.service_principal_id}
+    permissions:
+      - level: CAN_MANAGE
+        service_principal_name: ${var.service_principal_id}
+      - level: CAN_VIEW
+        group_name: engineers
+
+variables:
+  databricks_host:
+    description: Workspace URL for this environment, e.g. https://adb-xxxx.azuredatabricks.net
+  catalog:
+    description: Unity Catalog catalog for this target. Created by infra/ (Terraform).
+  service_principal_id:
+    description: Application ID of the execution service principal. Unused by the dev target.
+    default: ""

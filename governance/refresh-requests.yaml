@@ -1,0 +1,18 @@
+# Declarative full-refresh requests for the prd environment.
+# One entry per pipeline+release. Approval happens via PR review (CODEOWNERS-enforced).
+# This file declares INTENT only — execution outcomes are recorded as locked
+# GitHub issues (label: refresh-audit), never written back into this file.
+#
+# A release tag with no matching entry here deploys code and nothing else;
+# the refresh job is skipped entirely.
+#
+# pipeline_key    = the bundle resource key from databricks.yml (resources.pipelines.<key>)
+# release_version = the exact tag that should carry the refresh, e.g. 2.14.0
+#                   (bare semver — release tags carry no `v` prefix)
+# reason          = why, for the audit record. Keep it to one line.
+#
+# - pipeline_key: "orders_pipeline"
+#   release_version: "2.14.0"
+#   reason: "Upstream schema fix, JIRA-4821"
+
+[]
