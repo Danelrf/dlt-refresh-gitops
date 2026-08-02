@@ -26,7 +26,7 @@ variable "project" {
 }
 
 variable "location" {
-  description = "Azure region. Must support Databricks serverless compute — the bundle's pipeline is serverless."
+  description = "Azure region. Must offer the VM size in databricks.yml's node_type_id — the bundle's pipeline runs on classic compute."
   type        = string
   default     = "westeurope"
 }

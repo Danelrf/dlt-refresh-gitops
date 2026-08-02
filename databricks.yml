@@ -39,6 +39,23 @@ resources:
       catalog: ${var.catalog}
       schema: ${resources.schemas.bronze.name}
       serverless: false
+      photon: true
+      # Classic compute, so the pipeline brings its own cluster. Declaring only
+      # the `default` label means the maintenance cluster (nightly OPTIMIZE and
+      # VACUUM) inherits this same shape rather than falling back to a
+      # workspace default nobody chose.
+      clusters:
+        - label: default
+          node_type_id: ${var.node_type_id}
+          driver_node_type_id: ${var.node_type_id}
+          # Fixed size, not autoscale: at this volume the autoscaler would spend
+          # the whole update deciding, and a constant cluster shape makes one
+          # environment's run time directly comparable to another's. Raise
+          # num_workers per target if a full refresh starts outgrowing it.
+          num_workers: ${var.num_workers}
+          custom_tags:
+            environment: ${bundle.target}
+            managed_by: databricks-bundle
       libraries:
         - file:
             path: ./src/pipeline.py
@@ -98,6 +115,24 @@ targets:
 variables:
   catalog:
     description: Unity Catalog catalog for this target. Created by infra/ (Terraform).
+    # Defaulted to the dev catalog so the bundle needs no arguments on a
+    # laptop. Every target sets this explicitly anyway, so the default is only
+    # ever reachable from an unpinned local run — which is exactly the case
+    # where landing in orders_dev is the safe outcome.
+    default: orders_dev
   service_principal_id:
     description: Application ID of the execution service principal. Unused by the dev target.
     default: ""
+
+  # Pipeline compute. Kept as scalars rather than one complex variable so a
+  # target overrides only the dimension it cares about — prd could raise the
+  # worker count without restating the node type. Every target uses the
+  # defaults today; the knobs exist so growing one doesn't mean restructuring.
+  node_type_id:
+    description: Azure VM size for the pipeline's driver and workers.
+    # General-purpose, local-SSD, current generation. Available in westeurope
+    # (infra/platform/variables.tf), which is where the workspace lives.
+    default: Standard_D4ds_v5
+  num_workers:
+    description: Workers in the pipeline cluster, on top of the driver.
+    default: 1
