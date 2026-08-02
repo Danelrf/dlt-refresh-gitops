@@ -38,7 +38,7 @@ resources:
       name: "orders-pipeline-${bundle.target}"
       catalog: ${var.catalog}
       schema: ${resources.schemas.bronze.name}
-      serverless: true
+      serverless: false
       libraries:
         - file:
             path: ./src/pipeline.py
