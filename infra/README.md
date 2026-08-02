@@ -143,8 +143,9 @@ data without ceremony — see
   Databricks auto-provisions one per region for accounts created since late 2023.
   If yours predates that, create and assign a metastore once at account level;
   the config then works unchanged.
-- **Serverless region support.** The pipeline is serverless, so `location` must
-  be a region that offers it.
+- **Node type availability.** The pipeline uses classic compute, so `location`
+  must be a region that offers the `node_type_id` set in `databricks.yml`
+  (`Standard_D4ds_v5` by default).
 - **`force_destroy` defaults to `true`, including prd.** This is a learning
   project and being able to delete it matters more than being protected from
   deleting it. For anything real, set `force_destroy = false` in

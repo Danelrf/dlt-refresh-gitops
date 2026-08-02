@@ -24,10 +24,18 @@ resource "databricks_service_principal" "env" {
 
   display_name = "sp-${var.project}-${each.key}"
 
-  # Deploying a bundle and running a serverless pipeline needs workspace access
-  # and nothing else. No cluster creation, no SQL warehouse access.
+  # The pipeline uses classic compute (databricks.yml sets `serverless: false`),
+  # so it provisions its own cluster as the `run_as` principal — which is this
+  # service principal in tst and prd. Without the entitlement, every update
+  # fails at cluster provisioning with PERMISSION_DENIED.
+  #
+  # This is unrestricted cluster creation: these principals can create clusters
+  # of any shape, not just the one the pipeline declares. Bounding it means
+  # attaching a cluster policy and granting CAN_USE on it instead.
+  #
+  # SQL warehouse access is still not needed.
   workspace_access      = true
-  allow_cluster_create  = false
+  allow_cluster_create  = true
   databricks_sql_access = false
 }
 
