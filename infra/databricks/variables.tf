@@ -4,13 +4,18 @@ variable "databricks_account_id" {
 }
 
 variable "github_repo" {
-  description = "owner/name of the GitHub repository allowed to authenticate as the deploy service principals."
+  # Matched against the OIDC token's `sub` claim in identity.tf, so this must
+  # be in whatever form GitHub actually issues it in for this repo -- for
+  # repos created after 2026-07-15 that's the immutable-ID form
+  # (owner@ownerid/name@repoid), not the plain owner/name. bootstrap.sh and
+  # terraform.yml both compute this; don't hand-edit the default below.
+  description = "GitHub repository allowed to authenticate as the deploy service principals, in whatever subject form GitHub issues for it (owner/name, or owner@ownerid/name@repoid for repos created after 2026-07-15)."
   type        = string
-  default     = "Danelrf/dlt-refresh-gitops"
+  default     = "Danelrf@16457359/dlt-refresh-gitops@1319122401"
 
   validation {
     condition     = can(regex("^[^/]+/[^/]+$", var.github_repo))
-    error_message = "github_repo must be in owner/name form."
+    error_message = "github_repo must be in owner/name form (each segment may include an @id suffix)."
   }
 }
 
