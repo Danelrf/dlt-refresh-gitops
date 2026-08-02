@@ -11,6 +11,6 @@
 #                   (bare semver — release tags carry no `v` prefix)
 # reason          = why, for the audit record. Keep it to one line.
 #
-# - pipeline_key: "orders_pipeline"
-#   release_version: "1.0.0"
-#   reason: "Upstream schema fix, JIRA-4821"
+- pipeline_key: "orders_pipeline"
+  release_version: "1.0.1"
+  reason: "Upstream schema fix, JIRA-4821"
