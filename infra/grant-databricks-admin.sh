@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Grants the Terraform runner service principal the Databricks account_admin
-# role, via the Accounts Access Control API instead of the account console UI.
+# role, via the SCIM Service Principals API instead of the account console UI.
+# account_admin is a `roles` attribute on the principal itself -- the same
+# thing a human's first login into the console sets on them -- not a grant on
+# any rule set; the Accounts Access Control / rule-set API does not cover it.
 #
 # This still needs a human: only an existing account admin can grant that role
 # to anyone else, so the script authenticates interactively as one. What it
@@ -36,9 +39,6 @@ command -v jq >/dev/null || { echo "jq not found" >&2; exit 1; }
 
 APP_ID=$(az ad app list --display-name "$APP_NAME" --query "[0].appId" -o tsv)
 [ -n "$APP_ID" ] || { echo "Entra application ${APP_NAME} not found -- run bootstrap.sh first" >&2; exit 1; }
-PRINCIPAL="servicePrincipals/${APP_ID}"
-RESOURCE="accounts/${DATABRICKS_ACCOUNT_ID}"
-RULESET_NAME="${RESOURCE}/ruleSets/default"
 
 # ---------------------------------------------------------------------------
 # 1. Sign in as a human account admin. This is the one manual step left --
@@ -52,76 +52,122 @@ databricks auth login \
   --profile "$PROFILE"
 
 # ---------------------------------------------------------------------------
-# 2. Find the exact role string for "account admin". Docs disagree on
-#    whether it's account_admin or account.admin -- ask the API instead of
-#    guessing.
+# 2. Find the service principal at account level. Azure Databricks accounts
+#    sync service principals in from the Entra tenant automatically, so this
+#    one likely already exists even though nothing here created it -- but
+#    don't assume, since a from-scratch account may not have synced yet.
 # ---------------------------------------------------------------------------
 
-echo "==> Looking up the account admin role"
-ROLES_JSON=$(databricks account access-control get-assignable-roles-for-resource \
-  "$RESOURCE" --profile "$PROFILE" -o json)
-ROLE=$(jq -r '(.roles // [])[] | select(test("account.?admin"; "i"))' <<<"$ROLES_JSON" | head -1)
-if [ -z "$ROLE" ]; then
-  echo "    could not find an account-admin role among:" >&2
-  echo "$ROLES_JSON" >&2
-  exit 1
-fi
-echo "    ${ROLE}"
-
-# ---------------------------------------------------------------------------
-# 3. Register the service principal at account level, if it isn't already.
-# ---------------------------------------------------------------------------
-
-echo "==> Registering ${APP_NAME} at account level"
-if databricks account service-principals list --profile "$PROFILE" -o json \
-    | jq -e --arg id "$APP_ID" 'any(.[]; .applicationId == $id)' >/dev/null; then
-  echo "    already registered"
-else
-  databricks account service-principals create \
+echo "==> Looking up ${APP_NAME} at account level"
+SP_ID=$(databricks account service-principals list --profile "$PROFILE" -o json \
+  | jq -r --arg id "$APP_ID" '.[] | select(.applicationId == $id) | .id')
+if [ -z "$SP_ID" ]; then
+  echo "    not synced yet, registering explicitly"
+  SP_ID=$(databricks account service-principals create \
     --application-id "$APP_ID" --display-name "$APP_NAME" \
-    --profile "$PROFILE" -o none
-  echo "    registered"
+    --profile "$PROFILE" -o json | jq -r '.id')
 fi
+echo "    ${SP_ID}"
 
 # ---------------------------------------------------------------------------
-# 4. Grant the role: read -> merge -> write with the etag, so a concurrent
-#    change to the rule set is detected rather than silently overwritten.
+# 3. Grant account_admin. This is not a rule-set grant (that API only covers
+#    narrower roles -- billing, marketplace, service-principal management,
+#    etc; account_admin isn't in its assignable-roles list at all). It's a
+#    SCIM `roles` attribute on the principal itself, the same shape the
+#    console's own first-login bootstrap sets on a human user.
 # ---------------------------------------------------------------------------
 
-echo "==> Reading current rule set"
-CURRENT=$(databricks account access-control get-rule-set "$RULESET_NAME" "" \
-  --profile "$PROFILE" -o json)
-
-ALREADY=$(jq -r --arg role "$ROLE" --arg principal "$PRINCIPAL" '
-  [.grant_rules[]? | select(.role == $role) | .principals[]?] | index($principal) != null
-' <<<"$CURRENT")
+echo "==> Checking current roles"
+ALREADY=$(databricks account service-principals get "$SP_ID" --profile "$PROFILE" -o json \
+  | jq -r '[.roles[]?.value] | index("account_admin") != null')
 
 if [ "$ALREADY" = true ]; then
   echo "==> ${APP_NAME} is already an account admin"
 else
-  echo "==> Granting ${ROLE} to ${APP_NAME}"
-  REQUEST=$(jq -c --arg name "$RULESET_NAME" --arg role "$ROLE" --arg principal "$PRINCIPAL" '
-    {
-      name: $name,
-      rule_set: {
-        name: $name,
-        etag: .etag,
-        grant_rules: (
-          [.grant_rules[]? | select(.role != $role)]
-          + [{role: $role,
-              principals: (([.grant_rules[]? | select(.role == $role) | .principals[]?]) + [$principal] | unique)}]
-        )
-      }
-    }
-  ' <<<"$CURRENT")
-  databricks account access-control update-rule-set --profile "$PROFILE" --json "$REQUEST" -o none
+  echo "==> Granting account_admin to ${APP_NAME}"
+  databricks account service-principals patch "$SP_ID" --profile "$PROFILE" --json '{
+    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+    "Operations": [
+      {"op": "add", "path": "roles", "value": [{"value": "account_admin"}]}
+    ]
+  }' >/dev/null
+  echo "    granted"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Unity Catalog needs a metastore assigned to the workspace before
+#    catalog.tf can create anything in it. account_admin does not imply
+#    this -- accounts created since late 2023 get one auto-provisioned per
+#    region, but an older account (or one that already had a metastore from
+#    unrelated prior work) may not have it assigned to *this* workspace.
+# ---------------------------------------------------------------------------
+
+WORKSPACE_NAME="dbw-${PROJECT}"
+echo "==> Looking up workspace ${WORKSPACE_NAME}"
+WORKSPACE_ID=$(databricks account workspaces list --profile "$PROFILE" -o json \
+  | jq -r --arg name "$WORKSPACE_NAME" '.[] | select(.workspace_name == $name) | .workspace_id')
+[ -n "$WORKSPACE_ID" ] || { echo "    not found -- has infra/platform applied yet?" >&2; exit 1; }
+WORKSPACE_URL=$(databricks account workspaces get "$WORKSPACE_ID" --profile "$PROFILE" -o json | jq -r '.deployment_name' \
+  | sed 's#$#.azuredatabricks.net#;s#^#https://#')
+echo "    ${WORKSPACE_ID} (${WORKSPACE_URL})"
+
+echo "==> Checking metastore assignment"
+METASTORE_ID=$(databricks account metastore-assignments get "$WORKSPACE_ID" --profile "$PROFILE" -o json 2>/dev/null \
+  | jq -r '.metastore_id // empty')
+if [ -n "$METASTORE_ID" ]; then
+  echo "    already assigned: ${METASTORE_ID}"
+elif [ -n "${METASTORE_ID:=${DATABRICKS_METASTORE_ID:-}}" ]; then
+  echo "    assigning ${METASTORE_ID} (from DATABRICKS_METASTORE_ID)"
+  databricks account metastore-assignments create "$WORKSPACE_ID" "$METASTORE_ID" --profile "$PROFILE" >/dev/null
+else
+  METASTORES_JSON=$(databricks account metastores list --profile "$PROFILE" -o json)
+  METASTORE_COUNT=$(jq 'length' <<<"$METASTORES_JSON")
+  if [ "$METASTORE_COUNT" -eq 1 ]; then
+    METASTORE_ID=$(jq -r '.[0].metastore_id' <<<"$METASTORES_JSON")
+    echo "    no assignment yet; exactly one metastore exists (${METASTORE_ID}), assigning it"
+    databricks account metastore-assignments create "$WORKSPACE_ID" "$METASTORE_ID" --profile "$PROFILE" >/dev/null
+  else
+    echo "    not assigned, and ${METASTORE_COUNT} metastores exist -- ambiguous." >&2
+    echo "    Re-run with DATABRICKS_METASTORE_ID=<id> set to one of:" >&2
+    jq -r '.[] | "      \(.metastore_id)  \(.name)  (\(.region))"' <<<"$METASTORES_JSON" >&2
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Grant the runner SP CREATE CATALOG and CREATE EXTERNAL LOCATION on that
+#    metastore. account_admin does not imply these either -- they are
+#    metastore-level Unity Catalog privileges, granted through the
+#    workspace-scoped Permissions API (the account-level rule-set API used
+#    for account_admin has no concept of a metastore).
+# ---------------------------------------------------------------------------
+
+echo "==> Signing in to the workspace for Unity Catalog grants"
+databricks auth login --host "$WORKSPACE_URL" --profile "${PROFILE}-workspace"
+
+echo "==> Checking current metastore grants"
+NEEDED='["CREATE CATALOG", "CREATE EXTERNAL LOCATION"]'
+CURRENT_GRANTS=$(databricks grants get metastore "$METASTORE_ID" --profile "${PROFILE}-workspace" -o json)
+MISSING=$(jq -c --arg app_id "$APP_ID" --argjson needed "$NEEDED" '
+  ([.privilege_assignments[]? | select(.principal == $app_id) | .privileges[]?]) as $have
+  | $needed - $have
+' <<<"$CURRENT_GRANTS")
+
+if [ "$MISSING" = "[]" ]; then
+  echo "==> ${APP_NAME} already holds the needed metastore privileges"
+else
+  echo "==> Granting $(jq -rc . <<<"$MISSING") to ${APP_NAME} on the metastore"
+  REQUEST=$(jq -nc --arg app_id "$APP_ID" --argjson add "$MISSING" \
+    '{changes: [{principal: $app_id, add: $add}]}')
+  databricks grants update metastore "$METASTORE_ID" --profile "${PROFILE}-workspace" --json "$REQUEST" >/dev/null
   echo "    granted"
 fi
 
 cat <<EOF
 
 ────────────────────────────────────────────────────────────────────────
-${APP_NAME} (${APP_ID}) is now a Databricks account admin.
+${APP_NAME} (${APP_ID}) is now a Databricks account admin, with the metastore
+privileges infra/databricks/catalog.tf needs.
 
 One step still can't be automated -- the account ID doesn't exist to query
 until a human reads it off the console:
