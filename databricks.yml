@@ -58,8 +58,6 @@ targets:
   dev:
     mode: development
     default: true
-    workspace:
-      host: ${var.databricks_host}
     variables:
       catalog: orders_dev
 
@@ -68,8 +66,6 @@ targets:
   # resource names, which a shared environment needs.
   tst:
     mode: production
-    workspace:
-      host: ${var.databricks_host}
     variables:
       catalog: orders_tst
     run_as:
@@ -86,8 +82,6 @@ targets:
   # requires an approved entry in governance/refresh-requests.yaml.
   prd:
     mode: production
-    workspace:
-      host: ${var.databricks_host}
     variables:
       catalog: orders_prd
     # In prd the pipeline runs as the service principal, not a human —
@@ -102,8 +96,6 @@ targets:
         group_name: engineers
 
 variables:
-  databricks_host:
-    description: Workspace URL for this environment, e.g. https://adb-xxxx.azuredatabricks.net
   catalog:
     description: Unity Catalog catalog for this target. Created by infra/ (Terraform).
   service_principal_id:
