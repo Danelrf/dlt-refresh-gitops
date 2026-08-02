@@ -1,0 +1,159 @@
+name: Terraform
+
+# Infrastructure follows the same rule as pipeline code: proposed in a PR,
+# reviewed as a plan, applied only on merge. Nobody runs `terraform apply` from
+# a laptop after the one-time bootstrap.
+
+on:
+  pull_request:
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'infra/**'
+      - '.github/workflows/terraform.yml'
+
+# State is a single shared resource; two applies at once would fight over the
+# blob lease and one would simply fail.
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+env:
+  # Authentication is entirely federated: the runner exchanges its GitHub OIDC
+  # token for an Azure token. There is no client secret to store or rotate.
+  ARM_USE_OIDC: true
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+  # Input variables for both stages. Held as GitHub variables rather than
+  # committed tfvars because this repository is public and these identify the
+  # tenant, subscription and Databricks account.
+  TF_VAR_subscription_id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  TF_VAR_tenant_id: ${{ vars.ARM_TENANT_ID }}
+  TF_VAR_project: ${{ vars.TF_PROJECT }}
+  TF_VAR_location: ${{ vars.TF_LOCATION }}
+  TF_VAR_use_oidc: true
+  TF_VAR_databricks_account_id: ${{ vars.DATABRICKS_ACCOUNT_ID }}
+  TF_VAR_github_repo: ${{ github.repository }}
+  TF_VAR_state_resource_group: ${{ vars.TF_STATE_RESOURCE_GROUP }}
+  TF_VAR_state_storage_account: ${{ vars.TF_STATE_STORAGE_ACCOUNT }}
+  TF_VAR_state_container: ${{ vars.TF_STATE_CONTAINER }}
+
+  TF_IN_AUTOMATION: true
+
+jobs:
+  # Read-only. Runs without an environment, so it is gated by the runner's
+  # `pull_request` federated credential rather than by deployment reviewers.
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      # Establishes the az CLI session the databricks provider authenticates
+      # through. The azurerm provider uses ARM_USE_OIDC directly and does not
+      # need this, but the databricks provider has no OIDC flag of its own.
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive infra
+
+      - name: Plan — platform
+        working-directory: infra/platform
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=platform.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+          terraform plan -input=false -no-color | tee plan.txt
+
+      # Stage 2 reads stage 1's state, so on a brand-new setup this step has
+      # nothing to read until platform has been applied at least once.
+      - name: Plan — databricks
+        working-directory: infra/databricks
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=databricks.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+          terraform plan -input=false -no-color | tee plan.txt
+
+      - name: Publish plans
+        if: always()
+        run: |
+          for stage in platform databricks; do
+            echo "## Plan — ${stage}" >> "$GITHUB_STEP_SUMMARY"
+            echo '```terraform' >> "$GITHUB_STEP_SUMMARY"
+            cat "infra/${stage}/plan.txt" 2>/dev/null || echo "(no plan produced)"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          done
+
+  # `environment: infra` is what makes the runner's OIDC token carry the subject
+  # its federated credential accepts, and is where required reviewers attach.
+  apply:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: infra
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      # Order matters: stage 2 consumes stage 1's outputs.
+      - name: Apply — platform
+        working-directory: infra/platform
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=platform.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+          terraform apply -input=false -auto-approve
+
+      - name: Apply — databricks
+        working-directory: infra/databricks
+        run: |
+          terraform init -input=false \
+            -backend-config="resource_group_name=${{ vars.TF_STATE_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ vars.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ vars.TF_STATE_CONTAINER }}" \
+            -backend-config="key=databricks.tfstate" \
+            -backend-config="use_azuread_auth=true" \
+            -backend-config="use_oidc=true"
+          terraform apply -input=false -auto-approve

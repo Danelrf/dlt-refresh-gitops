@@ -1,7 +1,11 @@
 # dlt-refresh-gitops
 
-GitOps-style Databricks pipeline project: pipeline code and full-refresh
-governance in one repo, one release process.
+GitOps-style Databricks pipeline project: pipeline code, infrastructure and
+full-refresh governance in one repo, one release process.
+
+A full refresh is destructive. Here it is declared in a file, approved in a pull
+request, executed by a service principal that no human can impersonate, and
+recorded in a locked issue.
 
 ## Layout
 
@@ -11,30 +15,36 @@ governance in one repo, one release process.
 │   ├── pipeline.py                    # SDP pipeline (raw + incremental bronze table)
 │   └── transformations.py             # pure transforms, unit-tested
 ├── tests/                             # local pytest suite (real local Spark)
-├── pipelines/
+├── governance/
 │   └── refresh-requests.yaml          # declarative full-refresh requests
+├── infra/                             # Azure + Databricks infrastructure (Terraform)
+│   ├── bootstrap.sh                   # one-time local setup; everything else is CI
+│   ├── teardown.sh                    # deletes everything, including what Terraform can't
+│   ├── platform/                      # resource group, workspace, ADLS, access connector
+│   └── databricks/                    # service principals, federation policies, catalogs, grants
+├── docs/adr/                          # why every decision was made
 └── .github/
     ├── CODEOWNERS                     # approval gate on refresh requests
     └── workflows/
-        ├── deploy-tst.yml             # merge to main → test → deploy tst
-        └── release.yml                # tag v* → deploy prd → gated refresh → audit issue
+        ├── terraform.yml              # infra/** → plan on PR, apply on merge to main
+        └── deploy.yml                 # main → deploy tst; tag v* → deploy prd → gated refresh
 ```
 
 ## Environments
 
-| Target | Mode | Deployed by | Who can run the pipeline |
-|--------|------|-------------|--------------------------|
-| `dev`  | `development` | engineers, locally | the deploying engineer (resources are per-user prefixed) |
-| `tst`  | `production`  | CI on merge to `main` | engineers (`CAN_RUN`) |
-| `prd`  | `production`  | CI on tag `v*` | nobody — service principal only |
+| Target | Catalog | Deployed by | Who can run the pipeline | Engineer data access |
+|--------|---------|-------------|--------------------------|----------------------|
+| `dev`  | `orders_dev` | engineers, locally | the deploying engineer | full |
+| `tst`  | `orders_tst` | CI on merge to `main` or a release tag | engineers (`CAN_RUN`) | read |
+| `prd`  | `orders_prd` | CI on a release tag (`X.Y.Z`) | nobody — service principal only | `BROWSE` only, no rows |
 
-`tst` uses `mode: production` despite the name: that is what gives stable,
-unprefixed resource names, which a shared environment needs. `mode: development`
-prefixes everything with the deploying user and is for `dev` only.
+Each engineer gets their own prefixed schemas, volume and pipeline inside the
+shared `orders_dev` catalog, so nobody collides and nobody needs an
+infrastructure change to start work.
 
-Host and service-principal credentials come from **GitHub Environments** named
-`tst` and `prd`, so the two never share credentials and `prd` can carry
-deployment protection rules as a second gate.
+There are no credentials to share. Every identity authenticates by exchanging a
+short-lived GitHub OIDC token, accepted only for this repository and one exact
+GitHub Environment.
 
 ## The pattern
 
@@ -42,64 +52,17 @@ deployment protection rules as a second gate.
 Engineer opens PR → pipeline code change and/or a refresh request
 Merge to main     → unit tests → deploy to tst
 Platform lead approves refresh requests (CODEOWNERS-enforced, no self-approval)
-Tag vX.Y.Z        → deploy to prd, then:
+Tag X.Y.Z         → unit tests → deploy to tst → deploy to prd, then:
                       refresh-requests.yaml has an entry for this tag?
                         no  → refresh job is skipped, release ends here
                         yes → claim audit issue → full refresh → record outcome → lock
 ```
 
-Analogy: this is the Flyway/Liquibase migration pattern applied to pipeline
-refreshes — the requests file plays the role of migration scripts (declared
-intent, version-controlled, PR-reviewed) and the locked audit issues play the
-role of `flyway_schema_history` (execution record kept outside the files,
-checksummed against them).
-
-## Design decisions
-
-- **Code + refresh intent version together.** A release that changes the
-  pipeline logic AND requires a refresh is one PR, one review, one tag —
-  they can't drift apart.
-- **The requests file declares intent only.** No status fields, no CI
-  write-back. The repo answers "what was approved and by whom" (git/PR
-  history); the audit issues answer "what actually executed and when".
-  It is called `refresh-requests.yaml` rather than a "changelog" precisely
-  because it describes the future, not the past.
-- **Refresh is a separate, skippable job.** No entry for the tag means the
-  `refresh` job never starts — visible as a skipped job, not a silent no-op.
-  Two entries for one tag is a hard failure rather than a guess.
-- **Claim before acting.** The audit issue is created *before* the refresh is
-  triggered, then updated with the outcome and locked. A crash mid-run can
-  leave a refresh unrecorded otherwise — and since idempotency keys off that
-  record, the re-run would refresh twice.
-- **Audit record = locked GitHub issue**, not a Delta table (deletable, hard
-  to browse) and not raw run logs (hard to find). Locked on creation,
-  searchable by label, carries a SHA-256 integrity hash (edits become
-  detectable) and the Databricks `update_id` (cross-reference to
-  `system.access.audit` as the tamper-proof backstop).
-- **Idempotency fails closed.** If the workflow cannot determine whether a
-  refresh already ran, it refuses rather than risking a second destructive
-  refresh.
-- **Refresh reasons are never interpolated into shell.** They are PR-authored
-  text reaching a runner that holds the prd service principal secret, so they
-  travel as environment variables only.
-- **Execution identity is a service principal.** The `prd` target sets
-  `run_as` to the SP and grants engineers view-only; the workflow
-  authenticates with SP OAuth credentials. No human holds trigger permission
-  in prd. In `tst` engineers keep `CAN_RUN` — that is what tst is for.
-- **Bundle resource key, not UUID.** Requests reference `pipeline_key` (e.g.
-  `orders_pipeline`) and the workflow resolves it via the bundle — no
-  hardcoded pipeline IDs to keep in sync.
-- **No parallel workflow_dispatch path.** Releases are on-demand, so the PR
-  path is fast enough for ad-hoc needs. Break-glass for "the release pipeline
-  itself is broken": run `databricks bundle run <key> --target prd
-  --full-refresh-all` manually with SP credentials, then retroactively file
-  the audit issue.
-
 ## Local development
 
 Requires a JDK 17+ (PySpark 4). The test suite locates one automatically —
-`JAVA_HOME`, then `~/.jdks/*`, then `/Library/Java/JavaVirtualMachines/*` —
-so no shell configuration is needed.
+`JAVA_HOME`, then `~/.jdks/*`, then `/Library/Java/JavaVirtualMachines/*` — so no
+shell configuration is needed.
 
 ```bash
 uv sync          # create .venv with pyspark + pytest
@@ -116,52 +79,76 @@ To deploy your own isolated copy:
 databricks bundle deploy --target dev
 ```
 
-## Setup
-
-1. **Service principals** in your Databricks account, one per environment;
-   note their application IDs.
-2. **GitHub Environments** named `tst` and `prd`, each with:
-   - `DATABRICKS_HOST` (var) — e.g. `https://adb-xxxx.azuredatabricks.net`
-   - `SP_CLIENT_ID` (var) — service principal application ID
-   - `SP_CLIENT_SECRET` (secret) — SP OAuth secret
-
-   Add required reviewers to `prd` if you want a deployment gate on top of
-   CODEOWNERS.
-3. **GitHub settings**: create the `refresh-audit` label; branch protection /
-   org ruleset per `.github/CODEOWNERS` comments; engineers at Triage/Read so
-   they cannot edit or unlock audit issues.
-4. Update `CODEOWNERS` with your real team handle, and `src/pipeline.py`
-   with your actual source path/schema.
-5. First deploy: `databricks bundle deploy --target dev` locally to validate,
-   then merge to main for tst, then tag a release for prd.
-
 ## Requesting a refresh
 
-Add an entry to `pipelines/refresh-requests.yaml`:
+Add an entry to `governance/refresh-requests.yaml`:
 
 ```yaml
 - pipeline_key: "orders_pipeline"
-  release_version: "v2.14.0"
+  release_version: "2.14.0"
   reason: "Upstream schema fix, JIRA-4821"
 ```
 
-Open a PR, get platform-lead approval, merge, tag `v2.14.0`. Done.
+Open a PR, get platform-lead approval, merge, tag `2.14.0`. Done.
+
+## Setup
+
+Infrastructure and identities are Terraform — see [infra/README.md](infra/README.md)
+for the walkthrough. In short: run `infra/bootstrap.sh` once, grant the resulting
+principal Databricks account admin, apply the two Terraform stages, then
+`push-github-config.sh`. Everything after that is PR-driven.
+
+Repo settings that are policy rather than plumbing, and so are left to you:
+
+- Required reviewers on the `prd` and `infra` GitHub Environments.
+- The `refresh-audit` issue label.
+- Branch protection / org ruleset per `.github/CODEOWNERS`; engineers at
+  Triage/Read so they cannot edit or unlock audit issues.
+- `CODEOWNERS` pointed at your real team handle.
+
+## Tearing it down
+
+This is a learning project, and it is built to be deletable:
+
+```bash
+cd infra && ./teardown.sh
+```
+
+`terraform destroy` alone would leave the state account, the Entra application
+and the GitHub Environments behind, because those precede Terraform and appear in
+no state file. `teardown.sh` removes them too. It deletes production data without
+resistance — [ADR 0018](docs/adr/0018-optimise-for-clean-teardown.md) explains
+what safety that trades away and what to change for real use.
+
+## Why it is built this way
+
+Every significant decision — and the alternatives rejected along the way — is
+recorded in **[docs/adr/](docs/adr/)**.
+
+Start with [0015](docs/adr/0015-trunk-based-branching-and-release-flow.md) for how
+work reaches production, [0016](docs/adr/0016-declarative-refresh-requests.md)
+and [0017](docs/adr/0017-refresh-execution-safety-and-audit.md) for the refresh
+governance, and [0008](docs/adr/0008-oidc-federation-no-stored-secrets.md) for why
+there are no secrets anywhere.
 
 ## Known limits
 
-- **`--no-wait` means "triggered", not "succeeded".** The audit issue records
-  that a refresh started; completion must be confirmed on the Databricks
-  update it links to.
-- **Idempotency relies on GitHub's search index**, which lags issue creation
-  by seconds. Two release runs started within the same few seconds could both
-  miss the other's audit issue; the `concurrency` group makes that unlikely
-  rather than impossible.
+- **A refresh outliving the 6-hour job limit is recorded as `OUTCOME UNKNOWN`.**
+  The workflow waits for completion, but GitHub cancels the job at 360 minutes.
+  The record says so honestly rather than claiming failure, and a re-tag is
+  permitted.
+- **The release job blocks for the duration of the refresh**, holding the
+  `deploy` concurrency group. A long refresh delays other releases.
+- **Idempotency relies on GitHub's search index**, which lags issue creation by
+  seconds. Two release runs started within the same few seconds could both miss
+  the other's audit issue; the `concurrency` group makes that unlikely rather
+  than impossible.
+- **`refresh-requests.yaml` is not schema-validated on PRs**, so a malformed
+  entry surfaces at release time rather than at review time.
 
 ## Possible upgrades (not built yet, by design)
 
 - Mirror audit events to Log Analytics (independent privilege boundary) or
   immutable blob storage (true WORM) if tamper-resistance requirements grow.
-- Capture the PR approver identity in the audit issue via the GitHub API
-  (currently records the tagger via `github.actor`).
 - Per-pipeline CODEOWNERS strictness for tier-1/sensitive tables.
 - Validate `refresh-requests.yaml` schema on PRs, before the tag exists.

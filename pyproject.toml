@@ -1,0 +1,20 @@
+[project]
+name = "dlt-refresh-gitops"
+version = "0.1.0"
+description = "Lakeflow Spark Declarative Pipelines with full-refresh governance"
+requires-python = ">=3.10"
+# No runtime dependencies: Spark is provided by the Databricks runtime.
+dependencies = []
+
+# Dev-only. pyspark>=4.1 is what makes `from pyspark import pipelines as dp`
+# resolvable for IDE navigation and gives us pyspark.testing for unit tests.
+[dependency-groups]
+dev = [
+    "pyspark>=4.2.0",
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+python_files = "test_*.py"
