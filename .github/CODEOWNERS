@@ -1,7 +1,0 @@
-# Approval gate: only platform leads can approve full-refresh requests.
-# Combine with branch protection / org ruleset:
-#   - Require pull request before merging
-#   - Require review from Code Owners
-#   - Do not allow approval by the PR author
-#   - Do not allow bypassing (including admins) — use an org-level ruleset if available
-pipelines/refresh-requests.yaml   @your-org/platform-leads
